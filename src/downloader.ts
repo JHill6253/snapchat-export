@@ -127,6 +127,22 @@ export interface DownloadedMedia {
 }
 
 /**
+ * Additional file extracted from a ZIP (e.g., overlay)
+ */
+export interface AdditionalFile {
+  readonly data: Buffer;
+  readonly filename: string; // Original filename from ZIP
+  readonly type: 'overlay' | 'other';
+}
+
+/**
+ * Download result that may include additional files from a ZIP
+ */
+export interface DownloadedMediaWithExtras extends DownloadedMedia {
+  readonly additionalFiles?: readonly AdditionalFile[];
+}
+
+/**
  * Determine file extension from content type
  */
 export function getExtensionFromContentType(
@@ -192,11 +208,25 @@ export function isRetryableError(error: unknown): boolean {
 }
 
 /**
- * Download a single memory using POST method with retry logic
- * Snapchat's download mechanism requires:
- * 1. POST to the proxy URL with query params as body
- * 2. This returns a signed S3 URL
- * 3. GET the signed S3 URL to download the actual file
+ * Determine if a URL requires POST method (JSON export) or GET with redirects (HTML export)
+ *
+ * JSON export URLs: https://app.snapchat.com/dmd/memories?...&proxy=true&...
+ * HTML export URLs: https://us-east1-aws.api.snapchat.com/dmd/mm?...
+ */
+function isProxyUrl(url: string): boolean {
+  // JSON export URLs contain 'proxy=true' or go through app.snapchat.com
+  return url.includes('proxy=true') || url.includes('app.snapchat.com');
+}
+
+/**
+ * Download a single memory with retry logic
+ *
+ * Supports two download mechanisms:
+ * 1. Proxy URLs (JSON export): POST to proxy URL with query params as body, get signed URL, then GET file
+ * 2. Direct URLs (HTML export): GET request that follows redirects to signed S3 URL
+ *
+ * Also handles cases where the response is a ZIP file containing the media.
+ * When a ZIP is encountered, additional files (like overlays) are included in the result.
  */
 export async function downloadMemory(
   memory: SnapchatMemory,
@@ -204,67 +234,79 @@ export async function downloadMemory(
     maxRetries?: number;
     onRetry?: (attempt: number, delay: number, error: Error) => void;
   } = {}
-): Promise<DownloadedMedia> {
+): Promise<DownloadedMediaWithExtras> {
   const { maxRetries = DEFAULT_MAX_RETRIES, onRetry } = options;
   const url = memory.downloadUrl;
 
-  // Split URL at ? to separate base URL and query params
-  const [baseUrl, queryString] = url.split('?');
-
-  if (!queryString) {
-    throw new DownloadError(url, 0, 'Invalid download URL format - missing query parameters');
-  }
+  // Determine which download method to use
+  const useProxyMethod = isProxyUrl(url);
 
   let lastError: Error | null = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      // Step 1: POST to get the signed S3 URL
-      const proxyResponse = await fetch(baseUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: queryString,
-      });
+      let fileResponse: Response;
 
-      if (!proxyResponse.ok) {
-        const error = new DownloadError(url, proxyResponse.status, proxyResponse.statusText);
+      if (useProxyMethod) {
+        // Proxy method: POST to get signed URL, then GET the file
+        const [baseUrl, queryString] = url.split('?');
 
-        // Check if we should retry
-        if (attempt < maxRetries && isRetryableError(error)) {
-          lastError = error;
-          const delay = calculateBackoffDelay(attempt);
-
-          if (onRetry) {
-            onRetry(attempt + 1, delay, error);
-          }
-
-          await sleep(delay);
-          continue;
+        if (!queryString) {
+          throw new DownloadError(url, 0, 'Invalid download URL format - missing query parameters');
         }
 
-        throw error;
+        // Step 1: POST to get the signed S3 URL
+        const proxyResponse = await fetch(baseUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: queryString,
+        });
+
+        if (!proxyResponse.ok) {
+          const error = new DownloadError(url, proxyResponse.status, proxyResponse.statusText);
+
+          if (attempt < maxRetries && isRetryableError(error)) {
+            lastError = error;
+            const delay = calculateBackoffDelay(attempt);
+
+            if (onRetry) {
+              onRetry(attempt + 1, delay, error);
+            }
+
+            await sleep(delay);
+            continue;
+          }
+
+          throw error;
+        }
+
+        // The response body is the signed S3 URL
+        const signedUrl = await proxyResponse.text();
+
+        if (!signedUrl || !signedUrl.startsWith('http')) {
+          throw new DownloadError(
+            url,
+            0,
+            `Invalid signed URL response: ${signedUrl.substring(0, 100)}`
+          );
+        }
+
+        // Step 2: GET the actual file from the signed S3 URL
+        fileResponse = await fetch(signedUrl.trim());
+      } else {
+        // Direct method: GET with redirect following (for HTML export URLs)
+        // Node's fetch automatically follows redirects
+        fileResponse = await fetch(url, {
+          method: 'GET',
+          redirect: 'follow',
+        });
       }
-
-      // The response body is the signed S3 URL
-      const signedUrl = await proxyResponse.text();
-
-      if (!signedUrl || !signedUrl.startsWith('http')) {
-        throw new DownloadError(
-          url,
-          0,
-          `Invalid signed URL response: ${signedUrl.substring(0, 100)}`
-        );
-      }
-
-      // Step 2: GET the actual file from the signed S3 URL
-      const fileResponse = await fetch(signedUrl.trim());
 
       if (!fileResponse.ok) {
-        const error = new DownloadError(signedUrl, fileResponse.status, fileResponse.statusText);
+        const error = new DownloadError(url, fileResponse.status, fileResponse.statusText);
 
-        // Check if we should retry
         if (attempt < maxRetries && isRetryableError(error)) {
           lastError = error;
           const delay = calculateBackoffDelay(attempt);
@@ -285,7 +327,19 @@ export async function downloadMemory(
       const data = Buffer.from(arrayBuffer);
 
       if (data.length === 0) {
-        throw new DownloadError(signedUrl, fileResponse.status, 'Empty response body');
+        throw new DownloadError(url, fileResponse.status, 'Empty response body');
+      }
+
+      // Check if the response is a ZIP file (some HTML export URLs return ZIPs)
+      if (contentType.includes('zip') || isZipBuffer(data)) {
+        // Extract the base media and additional files from the ZIP
+        const extracted = await extractMediaFromZipWithExtras(data, memory.mediaType);
+        return {
+          data: extracted.baseMedia,
+          contentType: extracted.baseMediaType === 'jpg' ? 'image/jpeg' : 'video/mp4',
+          extension: extracted.baseMediaType,
+          additionalFiles: extracted.additionalFiles,
+        };
       }
 
       return {
@@ -541,60 +595,73 @@ export async function downloadMediaWithOverlay(
   const url = memory.mediaDownloadUrl || memory.downloadUrl;
   const isMediaUrl = !!memory.mediaDownloadUrl;
 
-  // Split URL at ? to separate base URL and query params
-  const [baseUrl, queryString] = url.split('?');
-
-  if (!queryString) {
-    throw new DownloadError(url, 0, 'Invalid download URL format - missing query parameters');
-  }
+  // Determine which download method to use
+  const useProxyMethod = isProxyUrl(url);
 
   let lastError: Error | null = null;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      // POST to get the signed URL
-      const proxyResponse = await fetch(baseUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-        },
-        body: queryString,
-      });
+      let fileResponse: Response;
 
-      if (!proxyResponse.ok) {
-        const error = new DownloadError(url, proxyResponse.status, proxyResponse.statusText);
+      if (useProxyMethod) {
+        // Proxy method: POST to get signed URL, then GET the file
+        const [baseUrl, queryString] = url.split('?');
 
-        if (attempt < maxRetries && isRetryableError(error)) {
-          lastError = error;
-          const delay = calculateBackoffDelay(attempt);
-
-          if (onRetry) {
-            onRetry(attempt + 1, delay, error);
-          }
-
-          await sleep(delay);
-          continue;
+        if (!queryString) {
+          throw new DownloadError(url, 0, 'Invalid download URL format - missing query parameters');
         }
 
-        throw error;
+        // POST to get the signed URL
+        const proxyResponse = await fetch(baseUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: queryString,
+        });
+
+        if (!proxyResponse.ok) {
+          const error = new DownloadError(url, proxyResponse.status, proxyResponse.statusText);
+
+          if (attempt < maxRetries && isRetryableError(error)) {
+            lastError = error;
+            const delay = calculateBackoffDelay(attempt);
+
+            if (onRetry) {
+              onRetry(attempt + 1, delay, error);
+            }
+
+            await sleep(delay);
+            continue;
+          }
+
+          throw error;
+        }
+
+        // The response body is the signed URL
+        const signedUrl = await proxyResponse.text();
+
+        if (!signedUrl || !signedUrl.startsWith('http')) {
+          throw new DownloadError(
+            url,
+            0,
+            `Invalid signed URL response: ${signedUrl.substring(0, 100)}`
+          );
+        }
+
+        // GET the actual file from the signed URL
+        fileResponse = await fetch(signedUrl.trim());
+      } else {
+        // Direct method: GET with redirect following (for HTML export URLs)
+        fileResponse = await fetch(url, {
+          method: 'GET',
+          redirect: 'follow',
+        });
       }
-
-      // The response body is the signed URL
-      const signedUrl = await proxyResponse.text();
-
-      if (!signedUrl || !signedUrl.startsWith('http')) {
-        throw new DownloadError(
-          url,
-          0,
-          `Invalid signed URL response: ${signedUrl.substring(0, 100)}`
-        );
-      }
-
-      // GET the actual file from the signed URL
-      const fileResponse = await fetch(signedUrl.trim());
 
       if (!fileResponse.ok) {
-        const error = new DownloadError(signedUrl, fileResponse.status, fileResponse.statusText);
+        const error = new DownloadError(url, fileResponse.status, fileResponse.statusText);
 
         if (attempt < maxRetries && isRetryableError(error)) {
           lastError = error;
@@ -616,7 +683,7 @@ export async function downloadMediaWithOverlay(
       const data = Buffer.from(arrayBuffer);
 
       if (data.length === 0) {
-        throw new DownloadError(signedUrl, fileResponse.status, 'Empty response body');
+        throw new DownloadError(url, fileResponse.status, 'Empty response body');
       }
 
       // Check if this is a ZIP file (mediaDownloadUrl returns ZIP)
@@ -675,12 +742,22 @@ function isZipBuffer(buffer: Buffer): boolean {
 }
 
 /**
- * Extract base media and overlay from a ZIP buffer
+ * Result of extracting media from a ZIP file
  */
-async function extractMediaFromZip(
+interface ExtractedZipContents {
+  readonly baseMedia: Buffer;
+  readonly baseMediaType: 'jpg' | 'mp4';
+  readonly additionalFiles: AdditionalFile[];
+}
+
+/**
+ * Extract base media and additional files from a ZIP buffer
+ * Keeps all files from the ZIP (overlay, etc.) as additional files
+ */
+async function extractMediaFromZipWithExtras(
   zipBuffer: Buffer,
   mediaType: 'Image' | 'Video'
-): Promise<ExtractedMediaContents> {
+): Promise<ExtractedZipContents> {
   // Dynamic import to avoid loading adm-zip until needed
   const AdmZip = (await import('adm-zip')).default;
 
@@ -689,40 +766,59 @@ async function extractMediaFromZip(
 
   let baseMedia: Buffer | null = null;
   let baseMediaType: 'jpg' | 'mp4' = mediaType === 'Image' ? 'jpg' : 'mp4';
-  let overlay: Buffer | null = null;
+  const additionalFiles: AdditionalFile[] = [];
 
   for (const entry of entries) {
     const name = entry.entryName.toLowerCase();
+    const originalName = entry.entryName;
 
     // Skip directories
     if (entry.isDirectory) continue;
 
     // Look for overlay PNG
     if (name.endsWith('.png') && (name.includes('overlay') || name === 'overlay.png')) {
-      overlay = entry.getData();
+      additionalFiles.push({
+        data: entry.getData(),
+        filename: originalName,
+        type: 'overlay',
+      });
       continue;
     }
 
-    // Look for base image (JPG/JPEG)
+    // Look for base image (JPG/JPEG) - identified by 'main' in name or just .jpg
     if (name.endsWith('.jpg') || name.endsWith('.jpeg')) {
-      baseMedia = entry.getData();
-      baseMediaType = 'jpg';
+      if (name.includes('main') || !baseMedia) {
+        baseMedia = entry.getData();
+        baseMediaType = 'jpg';
+      }
       continue;
     }
 
     // Look for base video (MP4)
     if (name.endsWith('.mp4')) {
-      baseMedia = entry.getData();
-      baseMediaType = 'mp4';
+      if (name.includes('main') || !baseMedia) {
+        baseMedia = entry.getData();
+        baseMediaType = 'mp4';
+      }
       continue;
     }
 
-    // Fallback: any PNG that's not the overlay might be the base image
-    if (name.endsWith('.png') && !overlay) {
-      // Check if this could be the overlay (has transparency) or base image
-      // For now, assume non-overlay PNGs could be overlays if we haven't found one
-      overlay = entry.getData();
+    // Any other PNG file - treat as potential overlay
+    if (name.endsWith('.png')) {
+      additionalFiles.push({
+        data: entry.getData(),
+        filename: originalName,
+        type: 'overlay',
+      });
+      continue;
     }
+
+    // Any other file - keep as 'other'
+    additionalFiles.push({
+      data: entry.getData(),
+      filename: originalName,
+      type: 'other',
+    });
   }
 
   // If we still don't have base media, try to find any image/video file
@@ -752,6 +848,25 @@ async function extractMediaFromZip(
   return {
     baseMedia,
     baseMediaType,
-    overlay,
+    additionalFiles,
+  };
+}
+
+/**
+ * Extract base media and overlay from a ZIP buffer (legacy function for overlay compositing)
+ */
+async function extractMediaFromZip(
+  zipBuffer: Buffer,
+  mediaType: 'Image' | 'Video'
+): Promise<ExtractedMediaContents> {
+  const result = await extractMediaFromZipWithExtras(zipBuffer, mediaType);
+
+  // Find overlay from additional files
+  const overlayFile = result.additionalFiles.find((f) => f.type === 'overlay');
+
+  return {
+    baseMedia: result.baseMedia,
+    baseMediaType: result.baseMediaType,
+    overlay: overlayFile?.data ?? null,
   };
 }

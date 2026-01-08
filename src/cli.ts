@@ -14,7 +14,7 @@ import {
   DEFAULT_DOWNLOAD_DELAY_MS,
   DEFAULT_CONCURRENCY,
   DEFAULT_MAX_RETRIES,
-  DownloadedMedia,
+  DownloadedMediaWithExtras,
 } from './downloader.js';
 import { saveMemory, formatStats, ensureDir } from './exporter.js';
 import { closeExiftool, formatGpsForDisplay } from './metadata.js';
@@ -79,7 +79,7 @@ export function createProgram(): Command {
     )
     .option('--photos', 'Import downloaded files into Apple Photos (macOS only)', false)
     .option('-l, --limit <n>', 'Limit number of memories to process (for testing)')
-    .option('--no-overlay', 'Skip overlay compositing (faster if overlay URLs are expired)', false)
+    .option('--no-overlay', 'Skip overlay compositing (faster if overlay URLs are expired)')
     .option('-i, --interactive', 'Run in interactive mode with guided prompts', false)
     .action(async (exportPath: string | undefined, opts: Record<string, unknown>) => {
       // If no path provided and not explicitly interactive, this is handled by index.ts
@@ -345,7 +345,7 @@ async function downloadWithProgress(
    */
   const processMemory = async (memory: SnapchatMemory): Promise<void> => {
     try {
-      let media: DownloadedMedia;
+      let media: DownloadedMediaWithExtras;
 
       // Try to download with overlay support if mediaDownloadUrl is available and not skipping overlays
       if (memory.mediaDownloadUrl && !options.skipOverlay) {
@@ -412,7 +412,7 @@ async function downloadWithProgress(
         }
       } else {
         // No mediaDownloadUrl, use regular download
-        media = await downloadMemory(memory, {
+        const downloaded = await downloadMemory(memory, {
           maxRetries: options.maxRetries,
           onRetry: (attempt, delay, error) => {
             stats.retries++;
@@ -423,6 +423,43 @@ async function downloadWithProgress(
             );
           },
         });
+
+        // Check if we got additional files (overlay) from a ZIP and should composite
+        const overlayFile = downloaded.additionalFiles?.find((f) => f.type === 'overlay');
+
+        if (overlayFile && !options.skipOverlay) {
+          // Composite the overlay
+          try {
+            const composited = await compositeMedia(
+              downloaded.data,
+              overlayFile.data,
+              memory.mediaType
+            );
+            media = {
+              data: composited.data,
+              contentType: composited.contentType,
+              extension: composited.extension,
+            };
+          } catch (compError) {
+            // If compositing fails, log warning and use base media
+            if (compError instanceof CompositeError) {
+              console.error(
+                `\n  Warning: Compositing failed for ${memory.mediaId.substring(0, 8)}: ${compError.message}. Using base media.`
+              );
+            }
+            media = {
+              data: downloaded.data,
+              contentType: downloaded.contentType,
+              extension: downloaded.extension,
+            };
+          }
+        } else {
+          media = {
+            data: downloaded.data,
+            contentType: downloaded.contentType,
+            extension: downloaded.extension,
+          };
+        }
       }
 
       try {

@@ -2,11 +2,11 @@
  * Compositor module for combining base media with overlay images
  *
  * Handles:
- * - Image compositing: base JPG + overlay PNG -> combined JPG
- * - Video compositing: base MP4 + overlay PNG -> combined MP4 (using ffmpeg)
+ * - Image compositing: base JPG + overlay PNG/WebP -> combined JPG
+ * - Video compositing: base MP4 + overlay PNG/WebP -> combined MP4 (using ffmpeg)
  */
 
-import { Jimp, JimpMime } from 'jimp';
+import sharp from 'sharp';
 import { spawn, spawnSync } from 'node:child_process';
 import { writeFile, mkdtemp, rm, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -63,34 +63,40 @@ export class CompositeError extends Error {
 }
 
 /**
- * Composite an image with an overlay PNG using Jimp (pure JavaScript)
+ * Composite an image with an overlay using sharp
+ * Supports JPG, PNG, WebP, and other formats for both base and overlay
  *
- * @param baseImage - The base image buffer (JPG/PNG)
- * @param overlay - The overlay image buffer (PNG with transparency)
+ * @param baseImage - The base image buffer (JPG/PNG/WebP)
+ * @param overlay - The overlay image buffer (PNG/WebP with transparency)
  * @returns Combined image as JPEG buffer
  */
 export async function compositeImage(baseImage: Buffer, overlay: Buffer): Promise<CompositeResult> {
   try {
-    // Load both images
-    const [base, overlayImg] = await Promise.all([Jimp.read(baseImage), Jimp.read(overlay)]);
+    // Get base image metadata to determine dimensions
+    const baseMetadata = await sharp(baseImage).metadata();
 
-    const baseWidth = base.width;
-    const baseHeight = base.height;
-
-    if (!baseWidth || !baseHeight) {
+    if (!baseMetadata.width || !baseMetadata.height) {
       throw new CompositeError('Image', 'Could not determine base image dimensions');
     }
 
-    // Resize overlay to match base image if dimensions differ
-    if (overlayImg.width !== baseWidth || overlayImg.height !== baseHeight) {
-      overlayImg.resize({ w: baseWidth, h: baseHeight });
-    }
+    // Resize overlay to match base image dimensions
+    const resizedOverlay = await sharp(overlay)
+      .resize(baseMetadata.width, baseMetadata.height, {
+        fit: 'fill', // Stretch to exact dimensions
+      })
+      .toBuffer();
 
-    // Composite overlay on top of base image
-    base.composite(overlayImg, 0, 0);
-
-    // Convert to JPEG buffer
-    const composited = await base.getBuffer(JimpMime.jpeg, { quality: 95 });
+    // Composite overlay on top of base image and output as JPEG
+    const composited = await sharp(baseImage)
+      .composite([
+        {
+          input: resizedOverlay,
+          top: 0,
+          left: 0,
+        },
+      ])
+      .jpeg({ quality: 95 })
+      .toBuffer();
 
     return {
       data: composited,

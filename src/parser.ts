@@ -1,5 +1,5 @@
 /**
- * Parser module for Snapchat JSON export files
+ * Parser module for Snapchat JSON and HTML export files
  */
 
 import { readFile } from 'node:fs/promises';
@@ -12,6 +12,14 @@ import {
   RawSnapchatExport,
   SnapchatMemory,
 } from './types.js';
+
+/**
+ * Result from finding memories file
+ */
+interface MemoriesFileResult {
+  path: string;
+  type: 'json' | 'html';
+}
 
 /**
  * Parse location string from Snapchat export
@@ -143,52 +151,162 @@ export function parseMemories(data: unknown): SnapchatMemory[] {
 }
 
 /**
- * Find the memories_history.json file in a Snapchat export folder
+ * Decode HTML entities in a string
  */
-export async function findMemoriesFile(exportPath: string): Promise<string> {
-  // Try direct path first
-  const directPath = join(exportPath, 'json', 'memories_history.json');
+function decodeHtmlEntities(text: string): string {
+  return text
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/g, "'")
+    .replace(/&#x2F;/g, '/');
+}
 
+/**
+ * Extract URL from onclick handler in HTML
+ * Format: onclick="downloadMemories('https://...', this, true); return false;"
+ */
+function extractUrlFromOnclick(onclick: string): string | null {
+  const match = onclick.match(/downloadMemories\s*\(\s*'([^']+)'/);
+  if (match) {
+    return decodeHtmlEntities(match[1]);
+  }
+  return null;
+}
+
+/**
+ * Parse memories from HTML table content
+ * Parses the memories_history.html format when JSON is not available
+ */
+export function parseMemoriesFromHtml(html: string): SnapchatMemory[] {
+  const memories: SnapchatMemory[] = [];
+
+  // Find all table rows (skip header row)
+  // Each data row has format: <tr><td>date</td><td>mediaType</td><td>location</td><td>download link</td></tr>
+  const rowRegex =
+    /<tr>\s*<td>([^<]+)<\/td>\s*<td>([^<]+)<\/td>\s*<td>([^<]*)<\/td>\s*<td>.*?onclick="([^"]+)".*?<\/td>\s*<\/tr>/g;
+
+  let match;
+  while ((match = rowRegex.exec(html)) !== null) {
+    const [, dateStr, mediaTypeStr, locationStr, onclick] = match;
+
+    try {
+      const downloadUrl = extractUrlFromOnclick(onclick);
+      if (!downloadUrl) {
+        console.warn('Skipping row: could not extract download URL from onclick handler');
+        continue;
+      }
+
+      const memory: SnapchatMemory = {
+        date: parseDate(dateStr.trim()),
+        mediaType: validateMediaType(mediaTypeStr.trim()),
+        location: parseLocation(locationStr.trim()),
+        downloadUrl: downloadUrl,
+        mediaDownloadUrl: null, // HTML format doesn't have overlay URLs
+        mediaId: extractMediaId(downloadUrl),
+      };
+
+      memories.push(memory);
+    } catch (error) {
+      console.warn(
+        `Skipping invalid HTML row: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  if (memories.length === 0) {
+    throw new ParseError(
+      'Could not parse any memories from HTML. The file format may have changed.'
+    );
+  }
+
+  return memories;
+}
+
+/**
+ * Try to read a file, returns null if it doesn't exist
+ */
+async function tryReadFile(path: string): Promise<string | null> {
   try {
-    await readFile(directPath);
-    return directPath;
+    return await readFile(path, 'utf-8');
   } catch {
-    // Try to find mydata~ folder
-    const { readdir } = await import('node:fs/promises');
-    const entries = await readdir(exportPath, { withFileTypes: true });
+    return null;
+  }
+}
 
+/**
+ * Find the memories file (JSON or HTML) in a Snapchat export folder
+ * Prefers JSON but falls back to HTML if JSON is not available
+ */
+export async function findMemoriesFile(exportPath: string): Promise<MemoriesFileResult> {
+  const { readdir } = await import('node:fs/promises');
+
+  // Paths to check in order of preference
+  const pathsToCheck: Array<{ jsonPath: string; htmlPath: string }> = [];
+
+  // Direct paths
+  pathsToCheck.push({
+    jsonPath: join(exportPath, 'json', 'memories_history.json'),
+    htmlPath: join(exportPath, 'html', 'memories_history.html'),
+  });
+
+  // Look for mydata~ folders
+  try {
+    const entries = await readdir(exportPath, { withFileTypes: true });
     for (const entry of entries) {
       if (entry.isDirectory() && entry.name.startsWith('mydata~')) {
-        const nestedPath = join(exportPath, entry.name, 'json', 'memories_history.json');
-        try {
-          await readFile(nestedPath);
-          return nestedPath;
-        } catch {
-          continue;
-        }
+        pathsToCheck.push({
+          jsonPath: join(exportPath, entry.name, 'json', 'memories_history.json'),
+          htmlPath: join(exportPath, entry.name, 'html', 'memories_history.html'),
+        });
       }
+    }
+  } catch {
+    // Ignore readdir errors
+  }
+
+  // Try each location, preferring JSON over HTML
+  for (const { jsonPath, htmlPath } of pathsToCheck) {
+    // Try JSON first
+    const jsonContent = await tryReadFile(jsonPath);
+    if (jsonContent !== null) {
+      return { path: jsonPath, type: 'json' };
+    }
+
+    // Fall back to HTML
+    const htmlContent = await tryReadFile(htmlPath);
+    if (htmlContent !== null) {
+      return { path: htmlPath, type: 'html' };
     }
   }
 
   throw new ParseError(
-    `Could not find memories_history.json in ${exportPath}. ` +
-      'Expected path: <export>/json/memories_history.json or <export>/mydata~*/json/memories_history.json'
+    `Could not find memories_history.json or memories_history.html in ${exportPath}. ` +
+      'Expected path: <export>/json/memories_history.json, <export>/html/memories_history.html, ' +
+      'or <export>/mydata~*/json/memories_history.json, <export>/mydata~*/html/memories_history.html'
   );
 }
 
 /**
  * Load and parse Snapchat memories from an export folder
+ * Supports both JSON and HTML export formats
  */
 export async function loadMemories(exportPath: string): Promise<SnapchatMemory[]> {
-  const memoriesFile = await findMemoriesFile(exportPath);
-  const content = await readFile(memoriesFile, 'utf-8');
+  const fileResult = await findMemoriesFile(exportPath);
+  const content = await readFile(fileResult.path, 'utf-8');
 
-  let data: unknown;
-  try {
-    data = JSON.parse(content);
-  } catch {
-    throw new ParseError('Invalid JSON in memories_history.json');
+  if (fileResult.type === 'json') {
+    let data: unknown;
+    try {
+      data = JSON.parse(content);
+    } catch {
+      throw new ParseError('Invalid JSON in memories_history.json');
+    }
+    return parseMemories(data);
+  } else {
+    // Parse HTML format
+    return parseMemoriesFromHtml(content);
   }
-
-  return parseMemories(data);
 }

@@ -84,7 +84,7 @@ export async function saveMemory(
   // Ensure output directory exists
   await ensureDir(dirname(outputPath));
 
-  // Write file
+  // Write main file
   await writeFile(outputPath, media.data);
 
   // Embed metadata if supported
