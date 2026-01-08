@@ -140,8 +140,8 @@ export async function compositeVideo(baseVideo: Buffer, overlay: Buffer): Promis
       '-i',
       tempOverlayPath,
       '-filter_complex',
-      // Scale overlay to match video dimensions, then overlay it
-      '[1:v]scale=iw:ih[scaled];[0:v][scaled]overlay=0:0:format=auto',
+      // Use scale2ref to scale overlay to match video dimensions, then overlay it
+      '[1:v][0:v]scale2ref=iw:ih[ovr][base];[base][ovr]overlay=0:0:format=auto',
       '-c:v',
       'libx264',
       '-preset',
