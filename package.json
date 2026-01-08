@@ -1,0 +1,73 @@
+{
+  "name": "snapchat-export",
+  "version": "1.0.0",
+  "description": "CLI tool to export Snapchat memories with preserved metadata",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "snapchat-export": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "build:bundle": "npx esbuild src/index.ts --bundle --platform=node --target=node18 --format=cjs --outfile=bundle/index.cjs --external:exiftool-vendored",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint src --ext .ts",
+    "lint:fix": "eslint src --ext .ts --fix",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\"",
+    "typecheck": "tsc --noEmit",
+    "pkg": "npm run build:bundle && pkg bundle/index.cjs --output SnapchatExport --compress GZip",
+    "pkg:macos": "npm run build:bundle && pkg bundle/index.cjs --target node18-macos-arm64,node18-macos-x64 --output SnapchatExport --compress GZip"
+  },
+  "pkg": {
+    "assets": [
+      "node_modules/@ffmpeg-installer/**/*",
+      "node_modules/exiftool-vendored.*/**/*"
+    ],
+    "targets": [
+      "node18-macos-arm64",
+      "node18-macos-x64"
+    ],
+    "outputPath": "bin"
+  },
+  "keywords": [
+    "snapchat",
+    "memories",
+    "export",
+    "photos",
+    "backup"
+  ],
+  "author": "John Hill",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0",
+    "@inquirer/prompts": "^8.1.0",
+    "adm-zip": "^0.5.16",
+    "cli-progress": "^3.12.0",
+    "commander": "^12.1.0",
+    "exiftool-vendored": "^28.3.1",
+    "jimp": "^1.6.0",
+    "ora": "^8.1.1"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.7",
+    "@types/cli-progress": "^3.11.6",
+    "@types/fluent-ffmpeg": "^2.1.28",
+    "@types/node": "^22.10.2",
+    "@typescript-eslint/eslint-plugin": "^8.18.1",
+    "@typescript-eslint/parser": "^8.18.1",
+    "@yao-pkg/pkg": "^6.11.0",
+    "esbuild": "^0.27.2",
+    "eslint": "^8.57.1",
+    "prettier": "^3.4.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

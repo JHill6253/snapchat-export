@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+bundle/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Test coverage
+coverage/
+
+# Snapchat exports (user data)
+mydata~/
+mydata~*/
+
+# Output directories
+snapchat-exports/
+exports/
+
+# Standalone executables
+SnapchatExport*
+bin/
+
+# Old Python implementation
+Snapchat_Memories_Tool/
+
+# Test/example files
+example-unzip/
